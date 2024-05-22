@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+#### args: iface1-iface2
+import sys,os
+import subprocess
+import time
+import json
+import argparse
+
+def colored(string, color):
+    colors = {'nc': '\033[0m', 'red': '\033[0;31m', 'green' : '\033[0;32m'}
+    if not color in colors:
+        color = 'nc'
+    return f'{colors[color]}{string}{colors["nc"]}'
+
+def exit_1(string):
+    print(string)
+    exit(1)
+
+OK = colored('OK','green')
+FAIL = colored('FAIL', 'red')
+s_log = None
+if_up_time = 3
+ns_exec = 'ip netns exec'
+p_args = None
+
+def find_close_obj(js):
+    js = js.strip()
+    p = 0
+    sp = 0
+    for s in js:
+        if s == '{':
+           sp += 1
+        if s == '}':
+           sp -= 1
+        p += 1
+        if sp == 0:
+            break
+    return p
+
+def split_json(js):
+    ret = []
+    while len(js):
+        p = find_close_obj(js)
+        ret.append(js[0:p])
+        js = js[p:].strip()
+    return ret
+
+def parse_args():
+    global p_args
+    methods=['iperf', 'iperf3']
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--check_time','-t', dest='check_time', type=int, default=30, help='Время работы iperf при каждом тесте')
+    parser.add_argument('--port', '-p', dest='port',type=int, default=50221, help='Порт для испоьзования сервера iperf')
+    parser.add_argument('--method', '-m', type=str, default='iperf3', choices=methods, help=f'Программа тестирования канала: ({", ".join(methods)})')
+    parser.add_argument('--ifaces','-i', dest='if_pair', nargs='+', help='Пары интерфейсов для тестирования, интерфейсы в паре разделяютя тире(-)')
+    parser.add_argument('--bitrate', '-b', dest='bitrate', type=int, default=0, help='Значение скорости для сравнения в Mbit/sec (0, если не сравнивает)')
+    parser.add_argument('--eps', '-e', dest='e', type=float, default=0.1, help='Максимальное отклонение от заданной скорости')
+    parser.add_argument('--config', '-c', dest='configfile', type=str, help='Файл конфигурации, если задан, остальные значения игнорируются. Если задан параметр --create_config, сохраняет в него')
+    parser.add_argument('--create_config', dest='create_config', action='store_true', default=False, help='Создать файл конфигурации из текущих параметров')
+    parser.add_argument('--debug', '-d', dest='debug', action='store_true', default=False, help='Вывод инфы для дебага')
+    p_args = parser.parse_args()
+    if p_args.create_config:
+        if not p_args.configfile:
+            exit_1('нужно указать имя файла для сохранения конфигурации')
+        create_config(p_args.__dict__, p_args.configfile)
+    if p_args.configfile:
+        p_args.__dict__ = load_config(p_args.configfile)
+
+def load_config(configfile):
+    try:
+        with open(configfile, 'r') as file:
+            j_str = file.read()
+            return json.loads(j_str)
+    except Exception as e:
+        exit_1(str(e))
+
+def create_config(args, configfile):
+    exclude_names = ['configfile', 'create_config']
+    args = { x:y for x,y in args.items() if x not in exclude_names }
+    to_file = json.dumps(args, indent=4)
+    with open(configfile, 'w') as file:
+        print(to_file, file=file)
+
+        print(f'{configfile} создан')
+    exit(0)
+
+def validate_pair(if_pair):
+    if len(if_pair) != 2:
+        print('invalid pair format')
+        return False
+    if if_pair[0] == if_pair[1]:
+        print(f'you shall not run exam on same iface: {if_pair[0]}')
+        return False
+    return True
+
+
+
+def check_bitrate(bitrate):
+    b_min = p_args.bitrate*(1-p_args.e)
+    b_max = p_args.bitrate*(1+p_args.e)
+    bitrate /= 1000000
+    if p_args.bitrate:
+        if bitrate < b_min:
+            return(f'Bitrate {bitrate} Mbit/s < {b_min} tool low ... {FAIL}')
+        elif bitrate > b_max:
+            return(f'Bitrate {bitrate} Mbit/s > {b_max} is very high (something went vrong) ...{FAIL}')
+        else:
+            return(f'Bitrate {bitrate} Mbit/s ... {OK}')
+    else:
+        return(f'Bitrate {bitrate} Mbit/s')
+
+def check_iface_count(if_pair):
+    ret = True
+    for iface in if_pair:
+        if iface in os.listdir('/sys/class/net'):
+            print(f'iface {iface} found')
+        else:
+            print(f'iface {iface} not found')
+            ret = False
+    return ret
+
+def do_in_netns(exam_ifaces):
+    ns_exec = 'ip netns exec'
+    def foo(if1, if2, timeout = 30, port = 50211):
+        for iface in {if1, if2}:
+            ipaddrs = {if1: '10.0.0.1', if2: '10.0.0.2'}
+            subprocess.run(f'ip netns add ns_{iface}'.split())
+            subprocess.run(f'ip link set {iface} netns ns_{iface}'.split())
+            subprocess.run(f'{ns_exec} ns_{iface} ip addr add dev {iface} {ipaddrs[iface]}/24'.split())
+            subprocess.run(f'{ns_exec} ns_{iface} ip link set dev {iface} up'.split())
+        time.sleep(if_up_time)
+        try:
+            bit_direct, bit_reverse = exam_ifaces(if1, if2, timeout, port)
+            print(f"{if1} <- {if2} {check_bitrate(bit_direct)}")
+            print(f"{if1} -> {if2} {check_bitrate(bit_reverse)}")
+        except Exception as e:
+            raise e
+        finally:
+            for iface in {if1, if2}:
+                subprocess.run(f'ip netns d ns_{iface}'.split())
+            time.sleep(if_up_time)
+    return foo
+
+@do_in_netns
+def exam_iperf3(if1, if2, timeout, port):
+    ipaddrs = {if1: '10.0.0.1', if2: '10.0.0.2'}
+    ## exam_channel by iperf3
+    ## run server in background
+    s_log = None
+    try:
+        print('start iperf3 server')
+        s_log = subprocess.Popen(f'ip netns exec ns_{if1} iperf3 -s -J --forceflush -p {port}',
+                                 stdout=subprocess.PIPE,
+                                 shell=True,
+                                 executable='/bin/bash',
+                                 )
+        time.sleep(if_up_time)
+        try:
+            print(f'checking bitrate {if1} -> {if2} for {timeout} sec')
+            direct_run = subprocess.run(f'{ns_exec} ns_{if2} iperf3 -c {ipaddrs[if1]} -p {port} -t {timeout}'.split(),
+                                        timeout=timeout + 5,
+                                        stdout=subprocess.DEVNULL)  # run direct
+        except:
+            direct_run = None
+            print('Direct run fail')
+        time.sleep(2)
+        try:
+            print(f'checking bitrate {if2} -> {if1} for {timeout} sec')
+            reverse_run = subprocess.run(
+                f'{ns_exec} ns_{if2} iperf3 -R -c {ipaddrs[if1]} -p {port} -t {timeout}'.split(),
+                timeout=timeout + 5,
+                stdout=subprocess.DEVNULL)  # run reverse
+        except:
+            reverse_run = None
+            print('Reverse run fail')
+        time.sleep(2)
+        s_log.terminate()
+        ## look results
+        if s_log is None:
+            exit_1('Bad iperf3 server run')
+        log = json.loads('[' +
+                         ','.join(split_json(s_log.communicate()[0].decode('utf-8'))) +
+                         ']')
+        try:
+            bit_direct = float(log[0]['end']['streams'][0]['receiver']['bits_per_second'])
+        except:
+            bit_direct = 0
+        try:
+            bit_reverse = float(log[1]['end']['streams'][0]['sender']['bits_per_second'])
+        except:
+            bit_reverse = 0
+        ####end examing by iperf3
+        return bit_direct, bit_reverse
+    except Exception as e:
+        print('use propalo')
+        raise e
+    finally:
+        if s_log:
+            s_log.terminate()
+
+@do_in_netns
+def exam_iperf(if1, if2, timeout, port):
+    ipaddrs = {if1: '10.0.0.1', if2: '10.0.0.2'}
+    bit_rate = []
+    s_log = None
+    for if1, if2 in [(if1, if2), (if2, if1)]:
+        try:
+            print(f'start iperf server')
+            s_log = subprocess.Popen(f'ip netns exec ns_{if1} iperf -s -p {port} -f b',
+                                     stdout=subprocess.PIPE,
+                                     shell=True,
+                                     executable='/bin/bash',
+                                     )
+            time.sleep(if_up_time)
+            print(f'')
+            print(f'checking bitrate {if1} -> {if2} for {timeout} sec')
+            direct_run = subprocess.run(f'{ns_exec} ns_{if2} iperf -c {ipaddrs[if1]} -p {port} -t {timeout}'.split(),
+                                        timeout=timeout + 5,
+                                        stdout=subprocess.DEVNULL)  # run direct
+            time.sleep(2)
+            s_log.terminate()
+            log = s_log.communicate()[0].decode('utf-8')
+        except Exception as e:
+            if s_log:
+                s_log.terminate()
+            raise e
+        try:
+            b_rate = log.strip().split('\n')[-1].split()[-2]
+            bit_rate.append(float(b_rate))
+        except:
+            bit_rate.append(0)
+    return tuple(bit_rate)
+
+def debug_msg(line):
+    if p_args.debug:
+        print(line)
+
+if __name__ == '__main__':
+    parse_args()
+    debug_msg(p_args.__dict__)
+    if os.geteuid() != 0:
+        exit_1("You need to have root privileges to run this script.\nPlease try again, this time using 'sudo'. Exiting.")
+    ### exam pairs loop
+    for if_pair_str in p_args.if_pair:
+        if_pair = tuple(if_pair_str.split('-'))
+        if not validate_pair(if_pair):
+            continue
+        if not check_iface_count(if_pair):
+            print(f'no one or more iface from: {if_pair[0]}, {if_pair[1]} in system ... {FAIL}')
+            continue
+        if p_args.method == 'iperf3':
+            exam_iperf3(if_pair[0], if_pair[1], p_args.check_time, p_args.port)
+        if p_args.method == 'iperf':
+            exam_iperf(if_pair[0], if_pair[1], p_args.check_time, p_args.port)
+    else:
+        print('Speed test done')
+
